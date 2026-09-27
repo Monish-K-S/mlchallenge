@@ -35,7 +35,16 @@ def build_training_matrix(
     ground_truth,
     neg_per_pos: int,
     rng: np.random.Generator,
+    max_neg_per_s1: int | None = None,
 ):
+    """Build (X, y) from blocked pairs.
+
+    Negatives are sampled per S1 *independently of positives* so that genuine
+    singletons (S1 with no true match) still contribute hard negatives.  The old
+    implementation only sampled negatives inside the positive loop, so singleton
+    S1 entities contributed nothing and the model never learned the abstain
+    decision the macro-F0.5 metric rewards.
+    """
     rows, y = [], []
     for s1 in s1_records:
         sid = s1["entity_id"]
@@ -43,26 +52,40 @@ def build_training_matrix(
         cands = candidates.get(sid, [])
         pos = [c for c in cands if c in truth]
         neg_pool = [c for c in cands if c not in truth]
+
         for pid in pos:
             rec = s23_by_id.get(pid)
             if rec is None:
                 continue
             rows.append(features_to_array(pair_features(s1, rec)))
             y.append(1)
-            if neg_pool:
-                take = min(neg_per_pos, len(neg_pool))
-                for nid in rng.choice(neg_pool, size=take, replace=False):
-                    nrec = s23_by_id.get(nid)
-                    if nrec is None:
-                        continue
-                    rows.append(features_to_array(pair_features(s1, nrec)))
-                    y.append(0)
+
+        if neg_pool:
+            # Scale negatives with positives, but always keep some for singletons
+            # so the model sees hard non-matches for entities with no true match.
+            take = max(neg_per_pos * max(1, len(pos)), neg_per_pos)
+            if max_neg_per_s1 is not None:
+                take = min(take, max_neg_per_s1)
+            take = min(take, len(neg_pool))
+            for nid in rng.choice(neg_pool, size=take, replace=False):
+                nrec = s23_by_id.get(nid)
+                if nrec is None:
+                    continue
+                rows.append(features_to_array(pair_features(s1, nrec)))
+                y.append(0)
+
     if not rows:
         return np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32), np.zeros(0, dtype=np.int8)
     return np.vstack(rows), np.asarray(y, dtype=np.int8)
 
 
-def score_all_pairs(s1_records, s23_by_id, candidates, model):
+def score_all_pairs(s1_records, s23_by_id, candidates, model, batch_size: int = 500_000):
+    """Score every blocked pair, returning per-S1 (candidate_id, prob) lists.
+
+    Predicts in batches so peak RAM stays bounded on full-data validation runs
+    (the naive version vstacked tens of millions of rows at once).
+    """
+    out = {s1["entity_id"]: [] for s1 in s1_records}
     pairs = []
     rows = []
     for s1 in s1_records:
@@ -73,13 +96,15 @@ def score_all_pairs(s1_records, s23_by_id, candidates, model):
                 continue
             pairs.append((sid, cid))
             rows.append(features_to_array(pair_features(s1, rec)))
-    out = {s1["entity_id"]: [] for s1 in s1_records}
-    if not rows:
-        return out
-    X = np.vstack(rows)
-    probs = model.predict_proba(X)[:, 1]
-    for (sid, cid), p in zip(pairs, probs):
-        out[sid].append((cid, float(p)))
+            if len(rows) >= batch_size:
+                probs = model.predict_proba(np.vstack(rows))[:, 1]
+                for (s, c), p in zip(pairs, probs):
+                    out[s].append((c, float(p)))
+                pairs, rows = [], []
+    if rows:
+        probs = model.predict_proba(np.vstack(rows))[:, 1]
+        for (s, c), p in zip(pairs, probs):
+            out[s].append((c, float(p)))
     return out
 
 
@@ -175,19 +200,32 @@ def main():
     val_cands = {k: v for k, v in all_cands.items() if k not in train_ids}
     print(f"Blocking done in {time.perf_counter()-t2:.1f}s", flush=True)
 
-    hit, total = 0, 0
+    hit, total, ent_hit, ent_total = 0, 0, 0, 0
     for r in val_s1:
         truth = set(gt.get(r["entity_id"], []))
         if not truth:
             continue
         total += len(truth)
         hit += len(truth & set(val_cands.get(r["entity_id"], [])))
+        ent_total += 1
+        if truth & set(val_cands.get(r["entity_id"], [])):
+            ent_hit += 1
     if total:
-        print(f"Val blocking recall (pair-level): {hit/total:.4f} ({hit}/{total})", flush=True)
+        print(
+            f"Val blocking recall (pair-level): {hit/total:.4f} ({hit}/{total})  "
+            f"(entity-level): {ent_hit/ent_total:.4f} ({ent_hit}/{ent_total})",
+            flush=True,
+        )
 
     print("Building training matrix...", flush=True)
     X, y = build_training_matrix(
-        train_s1, s23_by_id, train_cands, gt, config.NEG_PER_POS, rng
+        train_s1,
+        s23_by_id,
+        train_cands,
+        gt,
+        config.NEG_PER_POS,
+        rng,
+        max_neg_per_s1=config.MAX_NEG_PER_S1,
     )
     print(f"Pairs: {len(y)}  positives={int(y.sum())}  negatives={int((1-y).sum())}", flush=True)
 
@@ -212,14 +250,20 @@ def main():
     model.fit(
         Xtr,
         ytr,
-        eval_X=Xte,
-        eval_y=yte,
-        callbacks=[lgb.early_stopping(40, verbose=False)],
+        eval_set=[(Xte, yte)],
+        callbacks=[lgb.early_stopping(50, verbose=False)],
+    )
+    print(
+        f"Trained trees={model.booster_.num_trees()} "
+        f"(best_iteration={getattr(model, 'best_iteration_', None)})",
+        flush=True,
     )
 
     print("Scoring val + sweeping thresholds...", flush=True)
     scored = score_all_pairs(val_s1, s23_by_id, val_cands, model)
-    thresholds = [round(x, 2) for x in np.arange(0.55, 0.95, 0.03)]
+    # Sweep from low to high: the failure mode to guard against is a grid that
+    # starts too high and silently pins the model at all-singletons.
+    thresholds = [round(x, 2) for x in np.arange(0.30, 0.96, 0.02)]
     val_gt = {r["entity_id"]: gt.get(r["entity_id"], []) for r in val_s1}
     best_t, best_s = sweep_threshold(scored, val_gt, thresholds)
     print(f"Best threshold={best_t:.2f}  val macro_F0.5={best_s:.5f}", flush=True)

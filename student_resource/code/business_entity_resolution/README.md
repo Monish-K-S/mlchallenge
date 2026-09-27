@@ -18,7 +18,8 @@ business_entity_resolution/
     ├── metrics.py
     ├── io_utils.py
     ├── train.py
-    └── infer.py
+    ├── infer.py
+    └── evaluate.py       # full-pool macro-F0.5 + blocking recall (the feedback loop)
 ```
 
 Outputs are written to `student_resource/output/`:
@@ -62,16 +63,38 @@ python -m src.train
 python -m src.infer --split test
 ```
 
-## Speed knobs
+## Evaluate before submitting (do this every time)
+
+`src.evaluate` is the feedback loop that catches the classic failure mode where the
+pipeline predicts almost everything as a singleton. It runs blocking + scoring over
+the **full** S2/S3 pool and reports macro-F0.5, blocking recall, and how many links
+you predict (vs the ground-truth distribution):
+
+```bash
+# Score on a held-out slice of the training pool (has ground truth)
+python -m src.evaluate --split train --max-eval-s1 50000
+
+# Just check predicted-link distribution on test (no ground truth)
+python -m src.evaluate --split test --max-eval-s1 50000
+```
+
+If `avg_links/entity` is far below the training average (~3.5) or singletons are
+near 100%, your threshold/model is wrong — do **not** submit.
+
+## Speed / behaviour knobs (env vars or `config.py`)
 
 | Flag / setting | Effect |
 |----------------|--------|
-| `--nrows N` | Linked smoke sample + disk cache |
+| `--nrows N` | Linked smoke sample + disk cache (train only) |
 | `--max-train-s1 N` | Cap S1 when training on full files |
-| `--n-jobs` | Parallel blocking threads |
+| `--n-jobs` | Blocking worker **processes** |
 | `--chunk-size` | Infer S1 batch size |
-| `USE_METAPHONE=False` in `config.py` | Faster blocking keys (default) |
-| `MAX_CANDIDATES_PER_S1` | Fewer candidates → faster scoring |
+| `--min-evidence N` (infer) | Require N strong features to emit a link |
+| `ER_USE_METAPHONE=1` | Enable Double Metaphone blocking key (slower) |
+| `ER_MAX_CANDIDATES_PER_S1` | Candidates kept per S1 (default 200) |
+| `ER_MAX_BLOCK_BUCKET` | Max records per blocking bucket (default 5000) |
+| `ER_MIN_EVIDENCE_FEATURES` | Default for `--min-evidence` (0 = off) |
+| `ER_DATA_DIR` / `ER_OUTPUT_DIR` / `ER_ARTIFACTS_DIR` | Relocate data/outputs/artifacts |
 ## Validate submission (required before Portal upload)
 
 Run from **`student_resource/`** (not from `code/`):

@@ -16,9 +16,14 @@ def write_id_map(
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{id_col}\t{list_col}\n")
-        for s1 in s1_ids:
-            ids = list(dict.fromkeys([x for x in mapping.get(s1, []) if x]))
-            f.write(f"{s1}\t{','.join(ids)}\n")
+        write_id_map_rows(f, s1_ids, mapping)
+
+
+def write_id_map_rows(f, s1_ids: Iterable[str], mapping: Mapping[str, Iterable[str]]) -> None:
+    """Append rows to an already-open TSV file handle (no header)."""
+    for s1 in s1_ids:
+        ids = list(dict.fromkeys([x for x in mapping.get(s1, []) if x]))
+        f.write(f"{s1}\t{','.join(ids)}\n")
 
 
 def write_matching(path, s1_ids, mapping):

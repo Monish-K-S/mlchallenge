@@ -1,12 +1,22 @@
-"""Multi-key blocking / candidate generation (parallel + tight buckets)."""
+"""Multi-key blocking / candidate generation (process-parallel + tight buckets).
+
+Note on parallelism: :func:`candidate_indices_for` is pure-Python and GIL-bound,
+so a ``ThreadPoolExecutor`` gives almost no speedup.  We use
+``ProcessPoolExecutor`` with shared module-level state (set once via
+``_init_worker``) so the block indexes and record pool are inherited through
+fork rather than pickled per task.
+"""
 from __future__ import annotations
 
+import os
+import sys
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .config import (
     BLOCK_RARE_TOKEN_MAX_DF,
+    BLOCK_RARE_TOKEN_MIN_LEN,
     MAX_BLOCK_BUCKET,
     MAX_CANDIDATES_PER_S1,
     N_JOBS,
@@ -16,6 +26,11 @@ from .normalize import enrich_row
 
 
 Record = Dict
+
+# Shared per-worker state (populated once by _init_worker).  The indexes and pool
+# are sent to each worker a single time via the pool initializer instead of being
+# re-pickled for every task.
+_WORKER_STATE: Dict = {}
 
 
 def enrich_dataframe(df) -> List[Record]:
@@ -137,14 +152,14 @@ def build_block_indexes(candidates: Sequence[Record]) -> Dict:
         if rec["zip"] and rec["name_tokens"]:
             _add(by_zip_name, f"{country}||{rec['zip']}||{rec['name_tokens'][0]}", i)
         for tok in rec["name_token_set"]:
-            if len(tok) >= 4:  # rarer, fewer mega-buckets
+            if len(tok) >= BLOCK_RARE_TOKEN_MIN_LEN:  # rarer, fewer mega-buckets
                 token_df[tok] += 1
 
     by_rare: Dict[str, List[int]] = defaultdict(list)
     for i, rec in enumerate(candidates):
         country = rec["country"].lower()
         for tok in rec["name_token_set"]:
-            if len(tok) >= 4 and token_df[tok] <= BLOCK_RARE_TOKEN_MAX_DF:
+            if len(tok) >= BLOCK_RARE_TOKEN_MIN_LEN and token_df[tok] <= BLOCK_RARE_TOKEN_MAX_DF:
                 _add(by_rare, f"{country}||{tok}", i)
 
     return {
@@ -183,7 +198,10 @@ def candidate_indices_for(
     token_df = indexes["token_df"]
     rare = indexes["rare"]
     for tok in s1["name_token_set"]:
-        if len(tok) >= 4 and token_df.get(tok, 10**9) <= BLOCK_RARE_TOKEN_MAX_DF:
+        if (
+            len(tok) >= BLOCK_RARE_TOKEN_MIN_LEN
+            and token_df.get(tok, 10**9) <= BLOCK_RARE_TOKEN_MAX_DF
+        ):
             bucket = rare.get(f"{country}||{tok}")
             if bucket and len(bucket) <= max_bucket:
                 hits.update(bucket)
@@ -191,24 +209,24 @@ def candidate_indices_for(
     if not hits:
         return []
 
-    # Cap raw hits before expensive ranking
-    if len(hits) > max_candidates * 8:
-        # Prefer exact core / zip overlap without full sort of huge sets
-        exact = [
-            i
-            for i in hits
-            if pool[i]["core_name"] == s1["core_name"]
-            or (s1["zip"] and pool[i]["zip"] == s1["zip"])
-        ]
-        if len(exact) >= max_candidates:
-            hits = set(exact)
-        else:
-            # keep exact + sample of rest via cheap score on limited set
-            rest = list(hits - set(exact))
-            rest.sort(key=lambda i: cheap_pre_score(s1, pool[i]), reverse=True)
-            hits = set(exact) | set(rest[: max_candidates * 4])
+    # Always retain exact/zip evidence before ranking so a true match cannot be
+    # pruned away by the cheap pre-score when the candidate set is large.
+    exact = {
+        i
+        for i in hits
+        if (s1["core_name"] and pool[i]["core_name"] == s1["core_name"])
+        or (s1["zip"] and pool[i]["zip"] == s1["zip"])
+        or (s1["sorted_name"] and pool[i]["sorted_name"] == s1["sorted_name"])
+    }
+    rest = list(hits - exact)
+    # Bound the expensive pre-score set, but keep more than max_candidates.
+    rest_cap = max_candidates * 6
+    if len(rest) > rest_cap:
+        rest.sort(key=lambda i: cheap_pre_score(s1, pool[i]), reverse=True)
+        rest = rest[:rest_cap]
 
-    scored = [(cheap_pre_score(s1, pool[i]), i) for i in hits]
+    scored = [(cheap_pre_score(s1, pool[i]), i) for i in exact]
+    scored += [(cheap_pre_score(s1, pool[i]), i) for i in rest]
     scored.sort(reverse=True)
     return [i for _, i in scored[:max_candidates]]
 
@@ -226,14 +244,60 @@ def _ids_for_s1(args) -> Tuple[str, List[str]]:
     return s1["entity_id"], ids
 
 
+# Fields actually touched by candidate_indices_for / cheap_pre_score.  Slim
+# records keep worker payloads small: the char-3-gram frozensets (the dominant
+# memory cost of a full enriched record) are only needed at scoring time, which
+# runs in the parent process.
+_BLOCK_FIELDS = (
+    "entity_id",
+    "country",
+    "core_name",
+    "sorted_name",
+    "phonetic",
+    "zip",
+    "name_tokens",
+    "name_token_set",
+    "addr_token_set",
+)
+
+
+def slim_record(rec: Record) -> Record:
+    return {k: rec.get(k) for k in _BLOCK_FIELDS}
+
+
+def _init_worker_full(indexes: Dict, pool: Sequence[Record], max_candidates: int) -> None:
+    """Spawn path: state arrives pickled, once per worker."""
+    _WORKER_STATE["indexes"] = indexes
+    _WORKER_STATE["pool"] = pool
+    _WORKER_STATE["max_candidates"] = max_candidates
+
+
+def _init_worker_fork(max_candidates: int) -> None:
+    """Fork path (Linux): indexes/pool are inherited copy-on-write from the
+    parent, so only the scalar travels through the queue."""
+    _WORKER_STATE["max_candidates"] = max_candidates
+
+
+def _ids_for_chunk(chunk: Sequence[Record]) -> List[Tuple[str, List[str]]]:
+    indexes = _WORKER_STATE["indexes"]
+    pool = _WORKER_STATE["pool"]
+    max_candidates = _WORKER_STATE["max_candidates"]
+    return [_ids_for_s1((s1, indexes, pool, max_candidates)) for s1 in chunk]
+
+
 def generate_candidates(
     s1_records: Sequence[Record],
     s23_records: Sequence[Record],
     max_candidates: int = MAX_CANDIDATES_PER_S1,
     indexes: Optional[Dict] = None,
     n_jobs: int = N_JOBS,
+    chunk_size: int = 0,
 ) -> Dict[str, List[str]]:
-    """Return mapping S1 entity_id -> ranked S2/S3 candidate entity_ids."""
+    """Return mapping S1 entity_id -> ranked S2/S3 candidate entity_ids.
+
+    Workers share the indexes/pool via fork (Linux/EC2), so only the S1 chunks
+    cross the process boundary.  Set ``n_jobs <= 1`` to run serially in-process.
+    """
     if indexes is None:
         indexes = build_block_indexes(s23_records)
 
@@ -244,9 +308,51 @@ def generate_candidates(
             out[sid] = ids
         return out
 
-    payloads = [(s1, indexes, s23_records, max_candidates) for s1 in s1_records]
-    out = {}
-    with ThreadPoolExecutor(max_workers=n_jobs) as ex:
-        for sid, ids in ex.map(_ids_for_s1, payloads, chunksize=64):
+    from .config import BLOCK_CHUNK_SIZE
+
+    chunk = chunk_size or BLOCK_CHUNK_SIZE
+    slim_s1 = [slim_record(s1) for s1 in s1_records]
+    slim_pool = (
+        s23_records
+        if s23_records and set(s23_records[0]) <= set(_BLOCK_FIELDS)
+        else [slim_record(r) for r in s23_records]
+    )
+    chunks = [slim_s1[i : i + chunk] for i in range(0, len(slim_s1), chunk)]
+    out: Dict[str, List[str]] = {}
+
+    use_fork = sys.platform.startswith("linux")
+    if use_fork:
+        # Publish state in the parent BEFORE forking so children inherit the
+        # (large) indexes/pool copy-on-write instead of re-pickling them.
+        _WORKER_STATE["indexes"] = indexes
+        _WORKER_STATE["pool"] = slim_pool
+    try:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("fork" if use_fork else "spawn")
+        initargs = (
+            (max_candidates,)
+            if use_fork
+            else (indexes, slim_pool, max_candidates)
+        )
+        initializer = _init_worker_fork if use_fork else _init_worker_full
+        with ProcessPoolExecutor(
+            max_workers=n_jobs,
+            mp_context=ctx,
+            initializer=initializer,
+            initargs=initargs,
+        ) as ex:
+            for pairs in ex.map(_ids_for_chunk, chunks):
+                for sid, ids in pairs:
+                    out[sid] = ids
+    except (OSError, RuntimeError, ImportError) as exc:
+        # Fall back to serial if process start-up is blocked (e.g. sandbox).
+        print(f"  [blocking] process pool unavailable ({exc}); running serially", flush=True)
+        out = {}
+        for s1 in s1_records:
+            sid, ids = _ids_for_s1((s1, indexes, s23_records, max_candidates))
             out[sid] = ids
+    finally:
+        if use_fork:
+            _WORKER_STATE.clear()
     return out

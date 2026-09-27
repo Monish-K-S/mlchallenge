@@ -14,25 +14,51 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import config
 from src.blocking import build_block_indexes, generate_candidates, load_and_enrich
-from src.features import features_to_array, pair_features
-from src.io_utils import write_candidates, write_matching
+from src.features import (
+    FEATURE_NAMES,
+    evidence_count,
+    features_to_array,
+    pair_features,
+)
+from src.io_utils import write_id_map_rows
 
 
 def _index_by_id(records):
     return {r["entity_id"]: r for r in records}
 
 
-def score_candidates(s1_records, s23_by_id, candidates, model, threshold: float):
+def _check_model_compat(model) -> None:
+    """Fail loudly if the pickled model predates a feature-set change."""
+    n_model = getattr(model, "n_features_in_", None)
+    if n_model is not None and n_model != len(FEATURE_NAMES):
+        raise SystemExit(
+            f"Model expects {n_model} features but this code builds "
+            f"{len(FEATURE_NAMES)}. The trained artifact is stale — retrain with "
+            f"`python -m src.train` before running inference."
+        )
+
+
+def score_candidates(
+    s1_records,
+    s23_by_id,
+    candidates,
+    model,
+    threshold: float,
+    min_evidence: int = 0,
+):
     pairs = []
     rows = []
+    evidence = []
     for s1 in s1_records:
         sid = s1["entity_id"]
         for cid in candidates.get(sid, []):
             rec = s23_by_id.get(cid)
             if rec is None:
                 continue
+            feats = pair_features(s1, rec)
             pairs.append((sid, cid))
-            rows.append(features_to_array(pair_features(s1, rec)))
+            rows.append(features_to_array(feats))
+            evidence.append(evidence_count(feats))
     matches = {s1["entity_id"]: [] for s1 in s1_records}
     if not rows:
         return matches
@@ -42,9 +68,12 @@ def score_candidates(s1_records, s23_by_id, candidates, model, threshold: float)
     for i in range(0, len(rows), batch):
         X = np.vstack(rows[i : i + batch])
         probs[i : i + len(X)] = model.predict_proba(X)[:, 1]
-    for (sid, cid), p in zip(pairs, probs):
-        if float(p) >= threshold:
-            matches[sid].append(cid)
+    for (sid, cid), p, ev in zip(pairs, probs, evidence):
+        if float(p) < threshold:
+            continue
+        if min_evidence and ev < min_evidence:
+            continue
+        matches[sid].append(cid)
     return matches
 
 
@@ -62,6 +91,13 @@ def main():
     )
     parser.add_argument("--matching-out", type=Path, default=config.MATCHING_OUT)
     parser.add_argument("--candidate-out", type=Path, default=config.CANDIDATE_OUT)
+    parser.add_argument(
+        "--min-evidence",
+        type=int,
+        default=None,
+        help="Require at least N strong evidence features (exact core/zip/street/"
+        "phonetic) for a link. 0 disables. Default from config.MIN_EVIDENCE_FEATURES.",
+    )
     args = parser.parse_args()
 
     model_path = config.ARTIFACTS / "lgbm_matcher.pkl"
@@ -73,13 +109,22 @@ def main():
 
     with open(model_path, "rb") as f:
         model = pickle.load(f)
+    _check_model_compat(model)
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     threshold = (
         args.threshold
         if args.threshold is not None
         else float(meta.get("threshold", config.DEFAULT_THRESHOLD))
     )
-    print(f"Using threshold={threshold:.3f}", flush=True)
+    min_evidence = (
+        args.min_evidence
+        if args.min_evidence is not None
+        else config.MIN_EVIDENCE_FEATURES
+    )
+    print(
+        f"Using threshold={threshold:.3f}  min_evidence={min_evidence}",
+        flush=True,
+    )
 
     if args.split == "test":
         s1_path, s2_path, s3_path = config.TEST_S1, config.TEST_S2, config.TEST_S3
@@ -104,31 +149,40 @@ def main():
     indexes = build_block_indexes(s23)
     print(f"Indexes in {time.perf_counter()-t1:.1f}s", flush=True)
 
-    all_candidates = {}
-    all_matches = {}
+    # Stream outputs per chunk so peak RAM stays bounded: holding every
+    # candidate/match list for ~1.7M S1 entities would cost tens of GB.
     chunk = max(1000, args.chunk_size)
     n_chunks = (len(s1) + chunk - 1) // chunk
-    for ci, start in enumerate(range(0, len(s1), chunk), 1):
-        part = s1[start : start + chunk]
-        t2 = time.perf_counter()
-        cands = generate_candidates(
-            part, s23, indexes=indexes, n_jobs=args.n_jobs
-        )
-        matches = score_candidates(part, s23_by_id, cands, model, threshold)
-        all_candidates.update(cands)
-        all_matches.update(matches)
-        print(
-            f"  chunk {ci}/{n_chunks}: {len(part)} S1 in {time.perf_counter()-t2:.1f}s",
-            flush=True,
-        )
-
-    write_candidates(args.candidate_out, s1_ids, all_candidates)
-    write_matching(args.matching_out, s1_ids, all_matches)
+    args.candidate_out.parent.mkdir(parents=True, exist_ok=True)
+    args.matching_out.parent.mkdir(parents=True, exist_ok=True)
+    n_empty = n_links = 0
+    with (
+        open(args.candidate_out, "w", encoding="utf-8", newline="\n") as fc,
+        open(args.matching_out, "w", encoding="utf-8", newline="\n") as fm,
+    ):
+        fc.write("source1_entity_id\tcandidate_entity_ids\n")
+        fm.write("source1_entity_id\tmatched_entity_ids\n")
+        for ci, start in enumerate(range(0, len(s1), chunk), 1):
+            part = s1[start : start + chunk]
+            part_ids = [r["entity_id"] for r in part]
+            t2 = time.perf_counter()
+            cands = generate_candidates(
+                part, s23, indexes=indexes, n_jobs=args.n_jobs
+            )
+            matches = score_candidates(
+                part, s23_by_id, cands, model, threshold, min_evidence=min_evidence
+            )
+            write_id_map_rows(fc, part_ids, cands)
+            write_id_map_rows(fm, part_ids, matches)
+            n_empty += sum(1 for sid in part_ids if not matches.get(sid))
+            n_links += sum(len(matches.get(sid, ())) for sid in part_ids)
+            print(
+                f"  chunk {ci}/{n_chunks}: {len(part)} S1 in {time.perf_counter()-t2:.1f}s",
+                flush=True,
+            )
     print(f"Wrote {args.candidate_out}", flush=True)
     print(f"Wrote {args.matching_out}", flush=True)
 
-    n_empty = sum(1 for v in all_matches.values() if not v)
-    n_links = sum(len(v) for v in all_matches.values())
     print(
         f"S1={len(s1_ids)}  singletons={n_empty}  links={n_links}  "
         f"total {time.perf_counter()-t0:.1f}s",

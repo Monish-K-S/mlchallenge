@@ -1,1 +1,16 @@
 .DS_Store
+__pycache__/
+*.py[cod]
+
+# Data (large; distributed separately by the organizers)
+dataset/
+
+# Large trained artifacts / caches (regenerate via `python -m src.train`)
+student_resource/code/business_entity_resolution/artifacts/
+*.pkl
+*.pickle
+
+# Environments
+.venv/
+venv/
+env/
